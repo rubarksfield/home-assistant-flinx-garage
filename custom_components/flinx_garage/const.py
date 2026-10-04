@@ -1,0 +1,194 @@
+"""Constants for F-LINX Garage Door integration."""
+
+DOMAIN = "flinx_garage"
+
+# HTTP REST API
+API_BASE_URL = "https://api.bit-door.com"
+API_VERSION = "2.0.0"
+
+# MQTT broker (cloud, shared app credentials)
+MQTT_BROKER = "conn.bit-door.com"
+MQTT_PORT = 1883
+MQTT_USERNAME = "bd-app"
+MQTT_PASSWORD = "GwZEJ9R8RNi3yP4c"
+MQTT_KEEPALIVE = 60
+
+# MQTT topic template — {device_code} is the 16-hex-char deviceCode
+# Subscribes: attr/up (state reports), service/up (heartbeats),
+#             service/down (commands from cloud — read-only for us).
+# Publishes to service/down are ACL-blocked by the broker.
+MQTT_TOPIC_ATTR_UP = "/thing/dongle/{device_code}/attr/up"
+MQTT_TOPIC_SERVICE_UP = "/thing/dongle/{device_code}/service/up"
+MQTT_TOPIC_SERVICE_DOWN = "/thing/dongle/{device_code}/service/down"
+MQTT_TOPIC_WILDCARD = "/thing/dongle/{device_code}/#"
+
+# BLE configuration.
+BLE_NAME_PREFIXES = ("Noru_", "opener_")
+BLE_WRITE_CHAR = "02362a10-cf3a-11e1-efdc-000215d5c51b"
+BLE_NOTIFY_CHAR = "02362a11-cf3a-11e1-efdc-000215d5c51b"
+BLE_NOTIFY_CHAR2 = "02367a11-cf3a-11e1-efdc-000215d5c51b"
+
+# How long to wait for a device notification acknowledging a BLE command.
+# A bare GATT write succeeding does not mean the door accepted the frame, so
+# without an ack within this window we treat BLE as failed and fall back to cloud.
+BLE_ACK_TIMEOUT = 1.5  # seconds
+
+# How long a command waits for an in-flight BLE connect after the cloud has
+# refused it. The door can be off WiFi (the gateway answers "Device is offline")
+# while the opener is perfectly reachable over BLE a second or two later, so
+# local control gets the last word rather than the command being lost. Only ever
+# paid on a command that has already failed.
+BLE_COMMAND_CONNECT_WAIT = 6  # seconds
+
+# Upper bound on a single GATT write. A write through a BLE proxy waits for the
+# device's write response and can hang for the proxy's own timeout (30s with
+# ESPHome) if the device never answers. Commands must reach the door long before
+# that, so writes fail fast and fall back to the cloud instead.
+BLE_WRITE_TIMEOUT = 5  # seconds
+
+# Upper bound on a full BLE connect (link + service discovery + notify setup).
+# A proxy link can establish but then stall during discovery; the timeout stops
+# that from wedging _ble_connecting and frees the connection slot.
+BLE_CONNECT_TIMEOUT = 30  # seconds
+
+# BLE command generation is in crypto.py — commands are built dynamically from
+# the per-device devKey using AES-128-ECB encryption. No hardcoded blobs needed.
+
+# Attribute codes observed in MQTT attr/up reports (0x27XX big-endian)
+ATTR_DEVICE_NAME = 9984         # 0x2700, NUL-terminated Bluetooth name
+ATTR_DOOR_CONTROL = 10001       # Door control state
+ATTR_LED_TIMER = 10002
+ATTR_AUTO_CLOSE_DELAY = 10003
+ATTR_AUTO_CLOSE_ENABLED = 10004
+ATTR_LED_ENABLED = 10005        # LED feature enabled (always 1, NOT actual light state)
+ATTR_OPERATED_CYCLES = 10006    # 2-byte cumulative counter
+ATTR_MOTOR_BASELINE = 10010     # 2-byte motor force baseline
+ATTR_DOOR_POSITION = 10012      # 0-100% door position — PRIMARY state
+ATTR_LED_ACTUAL = 10013         # Actual LED state: 0xf0=on, 0xf1=off
+ATTR_DEVICE_ID = 10014          # 8-byte device ID (informational)
+
+# Known 2-byte attrs (vs default 1-byte)
+ATTR_SIZE_2B = {ATTR_OPERATED_CYCLES, ATTR_MOTOR_BASELINE}
+ATTR_SIZE_8B = {ATTR_DEVICE_ID}
+ATTR_SIZE_STR = {ATTR_DEVICE_NAME}
+
+# Attribute codes run 0x2700-0x2724. 0x2700-0x2708 are device metadata some
+# firmware prefixes to a report; the state attributes above start at 0x2709.
+ATTR_CODE_MIN = 0x2700          # 9984
+ATTR_CODE_MAX = 0x2724          # 10020
+ATTR_STATE_CODE_MIN = 0x2709    # 9993
+
+# Door states
+DOOR_STATE_CLOSED = 0
+DOOR_STATE_OPEN = 100
+
+# Software positioning (set_cover_position): the door has no native arbitrary-%
+# command, so we drive open/close and STOP when live position reaches target.
+POSITION_TOLERANCE = 3   # %, "already there" deadband for set_position requests
+POSITION_TIMEOUT = 30    # s, give up driving to a position after this long
+POSITION_POLL = 0.25     # s, how often to check live position while moving
+# The door coasts after STOP (command latency + MQTT update granularity + motor
+# momentum). We lead the stop by speed x this many seconds so it lands on target
+# instead of overshooting. Tune up if it still overshoots, down if it undershoots.
+POSITION_LEAD_TIME = 1.3  # s
+# A BLE reply reports the position within milliseconds, so when the live reading
+# is local there is far less latency to lead by. Overshoot comes from the motor's
+# own coast, not from waiting on the cloud.
+POSITION_LEAD_TIME_LOCAL = 0.4  # s
+# How recently a BLE report must have arrived to count as the live source.
+POSITION_LOCAL_MAX_AGE = 4  # s
+# The REST snapshot carries no timestamp, so its age is unknowable — it has been
+# seen a minute behind. It is only believed when nothing timestamped has been
+# heard for this long, i.e. when it is all we have.
+CLOUD_POSITION_TRUST_AFTER = 30  # s
+# An MQTT report's own timestamp is trusted only if it is anywhere near the
+# clock; outside this it is treated as undated, like the REST snapshot.
+REPORT_TS_SANITY = 600  # s
+# Drive passes allowed per set_position request: one to get there, one to correct
+# an overshoot. Bounded so a door that can't hold position doesn't hunt forever.
+POSITION_MAX_PASSES = 2
+# Time for the door to come to rest (and its report to arrive) before judging
+# where it landed.
+POSITION_SETTLE = 2.0  # s
+
+# Config entry format version. Bumped to 3 when the entry moved from one door
+# per entry to one account per entry (see async_migrate_entry in __init__.py).
+ENTRY_VERSION = 3
+
+# Config entry keys
+CONF_USERNAME = "username"
+CONF_PASSWORD = "password"
+CONF_DEVICE_CODE = "device_code"
+CONF_DEV_KEY = "dev_key"
+CONF_DOOR_ALIAS = "door_alias"
+CONF_DEVICES = "devices"
+# The opener's BLE local name as the cloud API reports it. This is what pins a
+# door to one peripheral, which is what makes BLE safe to use when more than one
+# door is configured.
+CONF_BLE_NAME = "ble_name"
+
+# queryDevice and deviceInfo both report the opener's BLE local name here, as
+# "<prefix>_<MAC without separators>" (e.g. Noru_<12 hex digits>). Their
+# bluetoothMac/bluetoothUuid fields are the iOS CoreBluetooth peripheral UUID,
+# not a MAC, so they are useless for matching on Home Assistant — the address
+# is recovered from the name instead.
+API_KEY_BLE_NAME = "bluetoothName"
+
+# Fallback name for a door the cloud API didn't give an alias for.
+DEFAULT_DOOR_ALIAS = "F-LINX Garage Door"
+
+# Options-flow keys
+CONF_POLL_INTERVAL = "poll_interval"
+CONF_CONNECTION_MODE = "connection_mode"
+
+# Which transports a command may use, and in which order. BLE is local and fast
+# but only reachable when the opener is in range of an adapter or proxy; the
+# cloud always works while the door is on WiFi, at the cost of a round trip.
+MODE_BLE_ONLY = "ble_only"
+MODE_BLE_PREFERRED = "ble_preferred"
+MODE_CLOUD_PREFERRED = "cloud_preferred"
+MODE_CLOUD_ONLY = "cloud_only"
+
+# Listed most-local first; this is the order the options form shows them in.
+CONNECTION_MODES = [
+    MODE_BLE_ONLY,
+    MODE_BLE_PREFERRED,
+    MODE_CLOUD_PREFERRED,
+    MODE_CLOUD_ONLY,
+]
+# The behaviour the integration had before the mode was configurable, so an
+# entry written without the option keeps working exactly as it did.
+DEFAULT_CONNECTION_MODE = MODE_BLE_PREFERRED
+
+# MODE_BLE_ONLY is the only mode that forbids the cloud outright: no MQTT
+# subscription, no REST poll, no login. The door's position then only ever comes
+# from the replies to commands Home Assistant itself sent.
+CLOUD_DISABLED_MODES = frozenset({MODE_BLE_ONLY})
+# MODE_CLOUD_ONLY leaves the Bluetooth stack entirely inert — no scan, no
+# connect, no reconnect timer — so the adapter's (or proxy's) slot stays free.
+BLE_DISABLED_MODES = frozenset({MODE_CLOUD_ONLY})
+
+# Optional periodic cloud poll (seconds). 0 = off (MQTT-only); default.
+# When set, the coordinator polls the REST API on this cadence regardless of
+# MQTT freshness, recovering state that MQTT silently dropped.
+POLL_INTERVAL_OFF = 0
+DEFAULT_POLL_INTERVAL = POLL_INTERVAL_OFF
+POLL_INTERVAL_CHOICES = [0, 60, 120, 180, 240, 300, 600, 900, 1800, 3600]
+
+# Cloud command controlIdent values
+# (Smi-decoded from Dart ARM64 assembly: raw 0x200N >> 1)
+CLOUD_CMD_OPEN = 4097
+CLOUD_CMD_CLOSE = 4098
+CLOUD_CMD_STOP = 4099
+CLOUD_CMD_PARTIAL = 4100    # Pedestrian/partial open (~20cm)
+CLOUD_CMD_LED_ON = 4101
+CLOUD_CMD_LED_OFF = 4102
+
+# Cloud command gateway URL (different from api.bit-door.com)
+CLOUD_GATEWAY_URL = "https://conn.bit-door.com"
+
+# Fallback polling interval when MQTT is not connected
+DEFAULT_FALLBACK_SCAN_INTERVAL = 60  # seconds
+
+# How long to assume MQTT is healthy after last message before falling back to polling
+MQTT_STALE_THRESHOLD = 30  # seconds

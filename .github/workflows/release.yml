@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version recorded in manifest.json and CHANGELOG.md (without v)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+  tests:
+    uses: ./.github/workflows/tests.yml
+  secrets:
+    uses: ./.github/workflows/secrets.yml
+  publish:
+    needs: [validate, tests, secrets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify release and extract notes
+        env:
+          FLINX_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          version = os.environ["FLINX_VERSION"]
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit("Only a stable X.Y.Z release is accepted")
+          manifest = json.loads(pathlib.Path("custom_components/flinx_garage/manifest.json").read_text())
+          if manifest["version"] != version:
+              raise SystemExit("Requested version does not match the manifest")
+          changelog = pathlib.Path("CHANGELOG.md").read_text()
+          notes = re.search(rf"^## {re.escape(version)}(?:[^\n]*)\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
+          if not notes:
+              raise SystemExit("A matching CHANGELOG section is required")
+          pathlib.Path("release-notes.md").write_text(notes.group(1).strip() + "\n")
+          PY
+      - name: Publish checked commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FLINX_VERSION: ${{ inputs.version }}
+        run: gh release create "v$FLINX_VERSION" --target "$GITHUB_SHA" --title "F-LINX Garage Door v$FLINX_VERSION" --notes-file release-notes.md

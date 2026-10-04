@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation and troubleshooting
+    url: https://github.com/rubarksfield/home-assistant-flinx-garage#install-with-hacs
+    about: Start with setup and the connection-mode guide.
+  - name: Private security report
+    url: https://github.com/rubarksfield/home-assistant-flinx-garage/security/advisories/new
+    about: Report vulnerabilities privately without working credentials.

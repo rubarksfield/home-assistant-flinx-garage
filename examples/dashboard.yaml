@@ -1,0 +1,15 @@
+# Replace the example entities with those from your F-LINX device.
+# Paste this card into the dashboard's manual card editor.
+type: vertical-stack
+cards:
+  - type: tile
+    entity: cover.example_garage_door
+    name: Garage door
+    features:
+      - type: cover-open-close
+  - type: tile
+    entity: light.example_garage_light
+    name: Opener light
+  - type: tile
+    entity: sensor.example_garage_operation_count
+    name: Operating cycles

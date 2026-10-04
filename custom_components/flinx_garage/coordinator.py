@@ -1,0 +1,1233 @@
+"""Coordinator for F-LINX Garage Door integration.
+
+Hybrid architecture:
+- MQTT subscribe for real-time state updates (primary, push-based)
+- BLE for sending commands (local, works when internet is down)
+- REST API for initial auth, device key fetch, and fallback state polling
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from typing import Any
+
+import aiohttp
+from bleak import BleakClient
+from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
+from homeassistant.components import bluetooth
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from .account import FlinxAccount
+from .const import (
+    API_BASE_URL,
+    API_KEY_BLE_NAME,
+    API_VERSION,
+    ATTR_DOOR_POSITION,
+    ATTR_LED_ACTUAL,
+    ATTR_OPERATED_CYCLES,
+    BLE_ACK_TIMEOUT,
+    BLE_COMMAND_CONNECT_WAIT,
+    BLE_CONNECT_TIMEOUT,
+    BLE_DISABLED_MODES,
+    BLE_NAME_PREFIXES,
+    BLE_NOTIFY_CHAR,
+    BLE_NOTIFY_CHAR2,
+    BLE_WRITE_CHAR,
+    BLE_WRITE_TIMEOUT,
+    CLOUD_CMD_CLOSE,
+    CLOUD_CMD_LED_OFF,
+    CLOUD_CMD_LED_ON,
+    CLOUD_CMD_OPEN,
+    CLOUD_CMD_STOP,
+    CLOUD_DISABLED_MODES,
+    CLOUD_GATEWAY_URL,
+    CLOUD_POSITION_TRUST_AFTER,
+    DEFAULT_CONNECTION_MODE,
+    DEFAULT_FALLBACK_SCAN_INTERVAL,
+    DOMAIN,
+    DOOR_STATE_CLOSED,
+    DOOR_STATE_OPEN,
+    MODE_BLE_ONLY,
+    MODE_CLOUD_ONLY,
+    MODE_CLOUD_PREFERRED,
+    MQTT_STALE_THRESHOLD,
+    POSITION_LEAD_TIME,
+    POSITION_LEAD_TIME_LOCAL,
+    POSITION_LOCAL_MAX_AGE,
+    POSITION_MAX_PASSES,
+    POSITION_POLL,
+    POSITION_SETTLE,
+    POSITION_TIMEOUT,
+    POSITION_TOLERANCE,
+    REPORT_TS_SANITY,
+)
+from .crypto import (
+    BLE_CMD_CLOSE,
+    BLE_CMD_LED_OFF,
+    BLE_CMD_LED_ON,
+    BLE_CMD_OPEN,
+    BLE_CMD_STOP,
+    build_ble_auth,
+    build_ble_command,
+    unwrap_ble_frame,
+)
+from .mqtt_client import FlinxMqttClient, parse_attr_report
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _is_flinx_name(name: str | None) -> bool:
+    """True when a BLE local name looks like an F-LINX door opener."""
+    return bool(name) and name.startswith(BLE_NAME_PREFIXES)
+
+
+# The MAC in an opener's name is NOT its BLE address: Noru_<12 hex digits>
+# advertises at <base MAC plus two>. The controller is ESP32-based, and its
+# Bluetooth address is the base MAC plus two, so the name can't be turned into
+# an address to match on — the name itself is the identity.
+
+
+class FlinxGarageCoordinator(DataUpdateCoordinator):
+    """Hybrid MQTT (state) + BLE (commands) coordinator."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: ConfigEntry,
+        account: FlinxAccount,
+        device_code: str,
+        dev_key: str,
+        door_alias: str,
+        ble_name: str | None = None,
+        ble_autodetect: bool = True,
+        poll_interval: int = 0,
+        connection_mode: str = DEFAULT_CONNECTION_MODE,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=config_entry,
+            name=DOMAIN,
+            # Light polling cadence — MQTT push is primary; polling is a fallback
+            # in case MQTT disconnects or we miss messages.
+            update_interval=timedelta(seconds=DEFAULT_FALLBACK_SCAN_INTERVAL),
+        )
+        self._account = account
+        self._device_code = device_code
+        self._dev_key = dev_key
+        self._door_alias = door_alias
+        # The opener's local name as the cloud reports it; refreshed from every
+        # deviceInfo read, so entries migrated from pre-3.0 pick it up too.
+        self._ble_name = ble_name
+        self._ble_autodetect = ble_autodetect
+        self._poll_interval = poll_interval
+        self._poll_unsub: Callable[[], None] | None = None
+        # Which transports this door may use. The two flags below are what the
+        # rest of the coordinator checks; the mode itself only decides the order
+        # commands try things in.
+        self._connection_mode = connection_mode
+        self._ble_enabled = connection_mode not in BLE_DISABLED_MODES
+        self._cloud_enabled = connection_mode not in CLOUD_DISABLED_MODES
+        # Warn only once per "BLE unusable" episode to avoid log spam (the BLE
+        # scan runs on every reconnect/fallback tick).
+        self._ble_not_connectable_warned = False
+
+        self._ble_client: BleakClient | None = None
+        self._ble_connecting = False
+        # The one in-flight connect attempt, so a command can wait for it
+        # instead of racing it.
+        self._connect_task: asyncio.Task[bool] | None = None
+        # Set on shutdown so a pending reconnect timer can't have a torn-down
+        # coordinator competing with its replacement for the proxy's slot.
+        self._closing = False
+        self._command_lock = asyncio.Lock()
+        # Why the last command didn't reach the door, for the error the entity
+        # raises — "Too frequent operation" and "Device is offline" are things
+        # the user can act on, so they must not be swallowed into a False.
+        self._last_command_error: str | None = None
+        self._last_notification: bytes | None = None
+        self._post_command_refresh: asyncio.Task[None] | None = None
+        self._position_task: asyncio.Task[None] | None = None
+
+        # Reassembly buffer for a notification split across MTU-sized chunks.
+        self._ble_frame = bytearray()
+
+        # State surface
+        self.door_position: int | None = None      # 0–100
+        self.position_source: str | None = None    # "MQTT", "BLE" or "cloud"
+        self.position_updated_at: float = 0.0      # loop clock, when it arrived
+        # Epoch second the applied position describes — not when it arrived. MQTT
+        # has been seen delivering reports 26s after the moment they describe, so
+        # ordering by arrival lets an old position overwrite a newer one.
+        self._position_ts: float = 0.0
+        self.led_state: bool | None = None         # True=on, False=off
+        self.operated_cycles: int | None = None
+        self.is_ble_connected: bool = False
+        self.firmware_version: str | None = None
+        self.is_online: bool | None = None
+        self.last_mqtt_ts: float = 0.0
+
+        # MQTT client (created after construction, started by __init__.py)
+        self.mqtt = FlinxMqttClient(
+            loop=hass.loop,
+            device_code=device_code,
+            dev_key_hex=dev_key,
+            on_attrs=self._on_mqtt_attrs,
+        )
+
+    @property
+    def device_code(self) -> str:
+        """Cloud device code (16 hex chars) for this coordinator."""
+        return self._device_code
+
+    @property
+    def door_alias(self) -> str:
+        """User-facing alias for this door."""
+        return self._door_alias
+
+    @property
+    def connection_mode(self) -> str:
+        """Which transports this door is allowed to use."""
+        return self._connection_mode
+
+    # -----------------------------------------------------------------
+    # Inbound state (MQTT attr/up and BLE command replies share a format)
+    # -----------------------------------------------------------------
+
+    async def _on_mqtt_attrs(self, attrs: dict[int, Any]) -> None:
+        """Called from the MQTT client when an attr/up message arrives."""
+        self.last_mqtt_ts = self.mqtt.last_message_ts
+        self._apply_attrs(attrs, source="MQTT")
+
+    @callback
+    def _apply_attrs(self, attrs: dict[int, Any], source: str = "BLE") -> None:
+        """Fold a decoded attribute report into the state surface."""
+        changed = False
+
+        pos = attrs.get(ATTR_DOOR_POSITION)
+        measured_at = self._report_ts(attrs, source)
+        if pos is not None and self._accept_position(pos, source, measured_at):
+            # Record freshness even when the value is unchanged: the positioning
+            # loop needs to know how current its reading is, not just that it
+            # differs from last time.
+            self.position_updated_at = self.hass.loop.time()
+            self.position_source = source
+            self._position_ts = measured_at or time.time()
+            if pos != self.door_position:
+                self.door_position = pos
+                changed = True
+
+        led_raw = attrs.get(ATTR_LED_ACTUAL)
+        if led_raw is not None:
+            # 0xf0 = LED on, 0xf1 = LED off
+            new_led = led_raw == 0xF0
+            if new_led != self.led_state:
+                self.led_state = new_led
+                changed = True
+
+        cycles = attrs.get(ATTR_OPERATED_CYCLES)
+        if cycles is not None and cycles != self.operated_cycles:
+            self.operated_cycles = cycles
+            changed = True
+
+        self.is_online = True
+
+        if changed:
+            _LOGGER.debug(
+                "%s state update: pos=%s led=%s cycles=%s",
+                source,
+                self.door_position,
+                self.led_state,
+                self.operated_cycles,
+            )
+            # Push the new state to entities
+            self.async_set_updated_data(self._build_state())
+
+    @staticmethod
+    def _report_ts(attrs: dict[int, Any], source: str) -> float | None:
+        """Epoch second an attribute report describes, or None if undated.
+
+        A BLE reply carries no timestamp but arrives within milliseconds of the
+        controller producing it, so its age is nil. An MQTT report carries the
+        controller's own timestamp; without a usable one there is no way to order
+        it against anything, so it counts as undated.
+        """
+        if source == "BLE":
+            return time.time()
+        reported = attrs.get("_ts")
+        if reported is None:
+            return None
+        if abs(time.time() - reported) > REPORT_TS_SANITY:
+            # A controller clock this far out tells us nothing about ordering.
+            _LOGGER.debug("Report timestamp %s is implausible; treating as undated", reported)
+            return None
+        return float(reported)
+
+    @callback
+    def _accept_position(
+        self, position: int, source: str, measured_at: float | None
+    ) -> bool:
+        """Whether a position report should be believed, by age not arrival.
+
+        MQTT delivers a report describing the door as it was up to half a minute
+        earlier, so ordering by arrival lets a position from the middle of a
+        movement land after the position the door finished at — the state jumps
+        backwards and the direction inverts with it. Reports are therefore
+        ordered by the moment they describe. The REST snapshot is undated and has
+        been seen a minute behind, so it is only believed when nothing dated has
+        been heard for a while — which is still what surfaces an operation done
+        from the app or a remote.
+        """
+        if measured_at is None:
+            age = time.time() - self._position_ts
+            if age >= CLOUD_POSITION_TRUST_AFTER:
+                return True
+            _LOGGER.debug(
+                "Ignoring undated %s position %s%%: a dated report landed %.0fs ago",
+                source, position, age,
+            )
+            return False
+
+        if measured_at >= self._position_ts:
+            return True
+
+        _LOGGER.debug(
+            "Ignoring %s position %s%%: it describes %.0fs before the %s%% we have",
+            source, position, self._position_ts - measured_at, self.door_position,
+        )
+        return False
+
+    @callback
+    def position_is_local(self) -> bool:
+        """True when the live position is coming from BLE right now.
+
+        A BLE reply lands within milliseconds of the door reporting, so the
+        positioning loop can lead the stop by much less than it must when it is
+        working from MQTT's several-second cadence.
+        """
+        return (
+            self.position_source == "BLE"
+            and self.hass.loop.time() - self.position_updated_at < POSITION_LOCAL_MAX_AGE
+        )
+
+    def _build_state(self) -> dict[str, Any]:
+        return {
+            "door_position": self.door_position,
+            "led_state": self.led_state,
+            "operated_cycles": self.operated_cycles,
+            "online": self.is_online,
+            "firmware": self.firmware_version,
+            "mqtt_connected": self.mqtt.is_connected,
+            "ble_connected": self.is_ble_connected,
+        }
+
+    # -----------------------------------------------------------------
+    # BLE command path
+    # -----------------------------------------------------------------
+
+    @callback
+    def _ble_notification(self, sender: int, data: bytes) -> None:
+        self._last_notification = data
+
+        # The reply to a command carries a full attribute report — the same TLVs
+        # MQTT delivers — so BLE is a state source too, and a local one: this
+        # arrives while the door is moving, whereas MQTT and the cloud go quiet
+        # whenever the controller drops off WiFi.
+        frame = bytes(data)
+        if frame[:2] == b"\x55\x55":
+            self._ble_frame = bytearray(frame)
+        elif self._ble_frame:
+            # A notification can be split across chunks by the MTU.
+            self._ble_frame += frame
+        else:
+            return
+
+        plaintext = unwrap_ble_frame(bytes(self._ble_frame), bytes.fromhex(self._dev_key))
+        if plaintext is None:
+            return
+        self._ble_frame.clear()
+        if attrs := parse_attr_report(plaintext):
+            _LOGGER.debug("BLE attr report received (%d fields)", len(attrs))
+            self._apply_attrs(attrs)
+
+    async def _ensure_ble_connected(self) -> bool:
+        if self._closing or not self._ble_enabled:
+            return False
+
+        if self._ble_client and self._ble_client.is_connected:
+            return True
+
+        if self._ble_connecting:
+            _LOGGER.debug("BLE: connect already in progress, skipping")
+            return False
+
+        self._ble_connecting = True
+        try:
+            ble_device = self._find_ble_device()
+            if ble_device is None:
+                return False
+
+            _LOGGER.debug("BLE: connecting to matched opener")
+            # Wrap the whole connect + service-discovery + notify setup in a
+            # timeout. A BLE-proxy link can establish at the radio level but
+            # stall during service discovery/notify subscription, which would
+            # otherwise leave us awaiting forever (and _ble_connecting stuck).
+            async with asyncio.timeout(BLE_CONNECT_TIMEOUT):
+                self._ble_client = await establish_connection(
+                    BleakClient,
+                    ble_device,
+                    ble_device.name or "flinx",
+                    disconnected_callback=self._on_ble_disconnect,
+                    max_attempts=2,
+                )
+                if not self._ble_client.services:
+                    await self._ble_client.get_services()
+
+                # Seen through ESPHome BLE proxies: 02367a11 is reported
+                # without a CCCD, so subscribing to it raises, even though
+                # phones see a CCCD on the same door. 02367a11 is optional.
+                # 02362a11 is the characteristic that carries the state stream
+                # and the command acks, so only that one is worth aborting for.
+                subscribed_primary = False
+                for char_uuid in (BLE_NOTIFY_CHAR, BLE_NOTIFY_CHAR2):
+                    try:
+                        await self._ble_client.start_notify(char_uuid, self._ble_notification)
+                    except BleakError as err:
+                        _LOGGER.debug(
+                            "BLE: %s not subscribable on this link (%s); continuing",
+                            char_uuid,
+                            type(err).__name__,
+                        )
+                    else:
+                        subscribed_primary |= char_uuid == BLE_NOTIFY_CHAR
+                if not subscribed_primary:
+                    # Without it the link is useless: no position updates, and
+                    # every command would stall for BLE_ACK_TIMEOUT before
+                    # falling back to the cloud. Better to fail the connect.
+                    raise BleakError(
+                        f"{BLE_NOTIFY_CHAR} not subscribable: no state or ack path"
+                    )
+
+                # Authenticate once per connection. The device validates this
+                # frame before it will accept any command; the app sends it
+                # once after service discovery (with a short settle delay).
+                await asyncio.sleep(0.8)
+                self._last_notification = None
+                # Bounded separately from the connect budget: a write that hangs
+                # on the proxy would otherwise eat the whole of it.
+                async with asyncio.timeout(BLE_WRITE_TIMEOUT):
+                    await self._ble_client.write_gatt_char(
+                        BLE_WRITE_CHAR, build_ble_auth(bytes.fromhex(self._dev_key))
+                    )
+                await self._wait_for_ble_ack(BLE_ACK_TIMEOUT)
+
+            self.is_ble_connected = True
+            _LOGGER.debug(
+                "BLE connected and authenticated (reply received=%s)",
+                self._last_notification is not None,
+            )
+            return True
+
+        except TimeoutError:
+            _LOGGER.debug("BLE: connect timed out after %ss", BLE_CONNECT_TIMEOUT)
+            await self._teardown_ble_client()
+            return False
+        except (BleakError, Exception) as err:  # noqa: BLE001
+            _LOGGER.debug("BLE connection failed (%s)", type(err).__name__)
+            await self._teardown_ble_client()
+            return False
+        finally:
+            self._ble_connecting = False
+
+    def _find_ble_device(self):
+        """Find *this door's* BLE peripheral among the discovered adverts."""
+        connectable = list(
+            bluetooth.async_discovered_service_info(self.hass, connectable=True)
+        )
+        device = self._match_ble_device(connectable)
+        if device is not None:
+            self._ble_not_connectable_warned = False
+            return device
+
+        self._log_no_ble_device(connectable)
+        return None
+
+    def _match_ble_device(self, service_infos):
+        """Return the advertisement that is certainly this door, or None.
+
+        Resolution is deliberately strict: with several doors in range, picking
+        the wrong peripheral would mean writing frames built from another door's
+        devKey. In order of confidence:
+
+        1. the opener name the cloud reports for this door (``bluetoothName``);
+        2. any Noru_*/opener_* peripheral — but only when this is the one and
+           only configured door, where there is nothing to confuse it with.
+        """
+        if self._ble_name:
+            wanted = self._ble_name.casefold()
+            for si in service_infos:
+                if si.name and si.name.casefold() == wanted:
+                    _LOGGER.debug(
+                        "BLE: matched configured opener (rssi=%s)", si.rssi,
+                    )
+                    return si.device
+            return None
+
+        if not self._ble_autodetect:
+            return None
+
+        for si in service_infos:
+            if _is_flinx_name(si.name):
+                _LOGGER.debug(
+                    "BLE: found connectable opener (rssi=%s)", si.rssi,
+                )
+                return si.device
+
+        return None
+
+    def _log_no_ble_device(self, connectable: list) -> None:
+        """Explain why no BLE connection is attempted.
+
+        Distinguishes "not seen at all", "seen but not connectable" (a
+        passive-only proxy), "the bound address is gone" and "several doors are
+        configured and this one isn't identifiable" — the last two are
+        actionable, so they warn (once per episode; this runs on every reconnect
+        attempt and fallback tick, so warning every time would spam).
+        """
+        all_si = list(
+            bluetooth.async_discovered_service_info(self.hass, connectable=False)
+        )
+        matches = [s for s in all_si if _is_flinx_name(s.name)]
+        detail = f"{len(matches)} matching adverts, {len(connectable)} connectable"
+        prefixes = ", ".join(f"{p}*" for p in BLE_NAME_PREFIXES)
+
+        if self._ble_name:
+            reason = "the configured opener is not connectable"
+            warn = True
+        elif not self._ble_autodetect:
+            reason = (
+                "the cloud reports no opener for this door, and with more than "
+                "one door configured an unidentified opener can't be assumed to "
+                "be this one"
+            )
+            warn = True
+        elif matches:
+            reason = f"{prefixes} seen but not connectable (proxy may be passive-only)"
+            warn = True
+        else:
+            reason = (
+                f"no {prefixes} device discovered "
+                f"({len(connectable)} connectable, {len(all_si)} total adverts)"
+            )
+            warn = False
+
+        if warn and not self._ble_not_connectable_warned:
+            self._ble_not_connectable_warned = True
+            _LOGGER.warning(
+                "BLE unavailable: %s; using cloud for commands [%s]",
+                reason, detail,
+            )
+        else:
+            _LOGGER.debug(
+                "BLE unavailable: %s [%s]", reason, detail,
+            )
+
+    async def _teardown_ble_client(self) -> None:
+        """Drop a half-open client so the proxy connection slot is freed."""
+        client, self._ble_client = self._ble_client, None
+        self.is_ble_connected = False
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+
+    def _on_ble_disconnect(self, client: BleakClient) -> None:
+        self.is_ble_connected = False
+        self._ble_client = None
+        if self._closing:
+            _LOGGER.debug("BLE disconnected during shutdown")
+            return
+        _LOGGER.debug("BLE disconnected — will reconnect in 10s")
+        # Reconnect after a delay to avoid churn with the BLE proxy
+        self.hass.loop.call_later(10, self._async_start_connect)
+
+    async def _send_ble_command(self, ble_cmd_id: int) -> bool:
+        """Send a command over BLE if already connected.
+
+        Returns True only if the door acknowledges with a notification — a
+        successful GATT write alone does not mean the device accepted the frame
+        (the auth/command format is reverse-engineered). Without an ack we
+        return False so the caller falls back to the cloud command.
+        """
+        if not self._ble_enabled:
+            return False
+
+        # Hold onto the client: a disconnect callback or a failing sibling
+        # command can drop self._ble_client while this one waits for the lock.
+        client = self._ble_client
+        if client is None or not client.is_connected:
+            # Not connected yet: kick off a connect in the background (so the
+            # next command can use BLE) but don't block this one — fall back to
+            # cloud immediately. Logs the connect lifecycle on button press.
+            _LOGGER.debug(
+                "BLE not connected (client=%s, connecting=%s); triggering connect, "
+                "using cloud for this command",
+                self._ble_client is not None,
+                self._ble_connecting,
+            )
+            self._async_start_connect()
+            return False
+        dev_key = bytes.fromhex(self._dev_key)
+        async with self._command_lock:
+            if client is not self._ble_client:
+                # It was torn down while we queued; the caller uses the cloud.
+                _LOGGER.debug("BLE link replaced while queueing; using cloud")
+                return False
+            try:
+                # Clear any stale notification before writing so the ack wait
+                # only sees a response triggered by this command. Auth was sent
+                # once at connect time, so we only write the command frame here.
+                self._last_notification = None
+                cmd_frame = build_ble_command(ble_cmd_id, dev_key)
+                async with asyncio.timeout(BLE_WRITE_TIMEOUT):
+                    await client.write_gatt_char(BLE_WRITE_CHAR, cmd_frame)
+            # Deliberately broad: BLE is the optimisation, the cloud is the
+            # fallback, so nothing on this path may fail the user's action. A
+            # proxy raises its own transport errors (e.g. aioesphomeapi's
+            # TimeoutAPIError), which are not BleakError.
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "BLE command failed (%s); using cloud", type(err).__name__,
+                )
+                # The link is suspect now — drop it so the slot is freed and the
+                # next command starts from a fresh connect.
+                await self._teardown_ble_client()
+                return False
+
+        # Wait (outside the write lock) for an acknowledgement notification.
+        acked = await self._wait_for_ble_ack(BLE_ACK_TIMEOUT)
+        if acked:
+            _LOGGER.debug("BLE command acknowledged")
+            return True
+        _LOGGER.debug("BLE command sent but no ack within %ss", BLE_ACK_TIMEOUT)
+        return False
+
+    @callback
+    def _async_start_connect(self) -> asyncio.Task[bool] | None:
+        """Start a connect attempt, or return the one already running.
+
+        The single gate on the whole BLE stack: with Bluetooth switched off this
+        returns None, which also stops the reconnect timer, the opportunistic
+        connect on the coordinator tick and _async_wait_for_ble.
+        """
+        if self._closing or not self._ble_enabled:
+            return None
+        if self._connect_task is not None and not self._connect_task.done():
+            return self._connect_task
+        self._connect_task = self.hass.async_create_task(self._ensure_ble_connected())
+        return self._connect_task
+
+    async def _async_wait_for_ble(self, timeout: float) -> bool:
+        """Wait up to timeout for a connect to finish. True if BLE is usable."""
+        if self._ble_client is not None and self._ble_client.is_connected:
+            return True
+        task = self._async_start_connect()
+        if task is None:
+            return False
+        try:
+            async with asyncio.timeout(timeout):
+                # Shielded: giving up on the wait must not cancel the connect,
+                # which the next command (or the fallback poll) can still use.
+                await asyncio.shield(task)
+        except (TimeoutError, asyncio.CancelledError):
+            _LOGGER.debug("BLE: still connecting after %ss", timeout)
+            return False
+        return self._ble_client is not None and self._ble_client.is_connected
+
+    async def _wait_for_ble_ack(self, timeout: float) -> bool:
+        """Poll for a notification arriving after the command write."""
+        deadline = self.hass.loop.time() + timeout
+        while self.hass.loop.time() < deadline:
+            if self._last_notification is not None:
+                return True
+            await asyncio.sleep(0.05)
+        return False
+
+    async def async_door_open(self) -> bool:
+        self._cancel_position_task()
+        return await self._send_command(
+            BLE_CMD_OPEN, CLOUD_CMD_OPEN, target_position=DOOR_STATE_OPEN
+        )
+
+    async def async_door_close(self) -> bool:
+        self._cancel_position_task()
+        return await self._send_command(
+            BLE_CMD_CLOSE, CLOUD_CMD_CLOSE, target_position=DOOR_STATE_CLOSED
+        )
+
+    async def async_door_stop(self) -> bool:
+        self._cancel_position_task()
+        return await self._send_command(BLE_CMD_STOP, CLOUD_CMD_STOP, target_position=None)
+
+    async def async_door_set_position(self, position: int) -> bool:
+        """Drive the door to a target open percentage (0=closed, 100=open).
+
+        The hardware has no native arbitrary-position command, so we send a
+        normal open/close (BLE-first, cloud fallback) and STOP once the live
+        position reaches the target. Endpoints (0/100) use the dedicated
+        open/close commands which drive to the hard limit.
+        """
+        target = max(DOOR_STATE_CLOSED, min(DOOR_STATE_OPEN, position))
+        if target >= DOOR_STATE_OPEN:
+            return await self.async_door_open()
+        if target <= DOOR_STATE_CLOSED:
+            return await self.async_door_close()
+
+        current = self.door_position
+        if current is None:
+            _LOGGER.warning("Cannot set position: current door position unknown")
+            self._last_command_error = (
+                "the door's current position is unknown, so there is nothing to "
+                "drive from - wait for a state update, or use open/close"
+            )
+            return False
+        if abs(current - target) <= POSITION_TOLERANCE:
+            _LOGGER.debug("Set position: already at ~%s%% (target %s)", current, target)
+            return True
+
+        # Supersede any in-flight positioning, then drive to the new target.
+        self._cancel_position_task()
+        self._position_task = self.hass.async_create_task(
+            self._drive_to_position(target)
+        )
+        return True
+
+    async def _drive_to_position(self, target: int) -> None:
+        """Drive to target, correcting once if the door didn't land close enough.
+
+        The STOP command's own BLE reply carries the settled position, so the
+        landing spot is known within milliseconds instead of whenever MQTT next
+        reports — which is what makes a correction pass worth doing at all.
+        """
+        try:
+            for attempt in range(POSITION_MAX_PASSES):
+                current = self.door_position
+                if current is None:
+                    _LOGGER.warning("Set position: position unknown, giving up")
+                    return
+                if abs(current - target) <= POSITION_TOLERANCE:
+                    if attempt:
+                        _LOGGER.debug(
+                            "Set position: landed at %s%% (target %s%%)", current, target
+                        )
+                    return
+                if attempt:
+                    _LOGGER.debug(
+                        "Set position: at %s%%, correcting toward %s%%", current, target
+                    )
+                await self._run_to_position(target, current)
+                # Let the stop's reply (and any trailing report) land.
+                await asyncio.sleep(POSITION_SETTLE)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if asyncio.current_task() is self._position_task:
+                self._position_task = None
+
+    async def _run_to_position(self, target: int, start: int) -> None:
+        """Open/close toward target and STOP when live position reaches it."""
+        opening = target > start
+        ok = await self._send_command(
+            BLE_CMD_OPEN if opening else BLE_CMD_CLOSE,
+            CLOUD_CMD_OPEN if opening else CLOUD_CMD_CLOSE,
+            target_position=None,
+        )
+        if not ok:
+            _LOGGER.warning("Set position: failed to start movement toward %s%%", target)
+            return
+
+        # Predictive stop: the door coasts after STOP, so estimate its speed from
+        # the live position stream and stop once the *projected* landing spot
+        # (pos + speed x lead) reaches the target. How far ahead to lead depends
+        # on where the readings come from: a BLE reply is near-instant, while
+        # MQTT's cadence means the door has already moved on by the time we see a
+        # value, so it needs a much bigger lead.
+        last_pos = start
+        last_t = self.hass.loop.time()
+        speed = 0.0  # %/s magnitude; smoothed
+        lead_time = POSITION_LEAD_TIME
+        deadline = last_t + POSITION_TIMEOUT
+        while self.hass.loop.time() < deadline:
+            await asyncio.sleep(POSITION_POLL)
+            pos = self.door_position
+            now = self.hass.loop.time()
+            if pos is None:
+                continue
+            if pos != last_pos:
+                dt = now - last_t
+                if dt > 0:
+                    inst = abs(pos - last_pos) / dt
+                    # EMA-smooth; seed on the first observed movement.
+                    speed = inst if speed == 0 else 0.6 * speed + 0.4 * inst
+                last_pos = pos
+                last_t = now
+            lead_time = (
+                POSITION_LEAD_TIME_LOCAL
+                if self.position_is_local()
+                else POSITION_LEAD_TIME
+            )
+            lead = speed * lead_time
+            projected = pos + lead if opening else pos - lead
+            if (opening and projected >= target) or (
+                not opening and projected <= target
+            ):
+                break
+        else:
+            _LOGGER.warning("Set position: timed out before reaching %s%%", target)
+
+        await self._send_command(BLE_CMD_STOP, CLOUD_CMD_STOP, target_position=target)
+        landing = last_pos + (speed * lead_time if opening else -speed * lead_time)
+        _LOGGER.debug(
+            "Set position: target %s%%, stop issued at pos=%s speed=%.1f%%/s via %s "
+            "(projected ~%s%%, lead %.1fs)",
+            target, last_pos, speed, self.position_source or "?", round(landing), lead_time,
+        )
+
+    @callback
+    def _cancel_position_task(self) -> None:
+        """Cancel an in-flight positioning loop (but never cancel ourselves)."""
+        task = self._position_task
+        self._position_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def async_led_on(self) -> bool:
+        ok = await self._send_command(BLE_CMD_LED_ON, CLOUD_CMD_LED_ON)
+        if ok:
+            self.led_state = True
+            self.async_set_updated_data(self._build_state())
+        return ok
+
+    async def async_led_off(self) -> bool:
+        ok = await self._send_command(BLE_CMD_LED_OFF, CLOUD_CMD_LED_OFF)
+        if ok:
+            self.led_state = False
+            self.async_set_updated_data(self._build_state())
+        return ok
+
+    async def _send_command(
+        self,
+        ble_cmd_id: int,
+        cloud_control_ident: int,
+        target_position: int | None = None,
+    ) -> bool:
+        """Send a command over the transports the connection mode allows."""
+        self._last_command_error = None
+
+        if self._connection_mode == MODE_BLE_ONLY:
+            ok = await self._send_ble_only(ble_cmd_id)
+        elif self._connection_mode == MODE_CLOUD_ONLY:
+            ok = await self._send_cloud_command(cloud_control_ident)
+        elif self._connection_mode == MODE_CLOUD_PREFERRED:
+            ok = await self._send_cloud_first(ble_cmd_id, cloud_control_ident)
+        else:
+            ok = await self._send_ble_first(ble_cmd_id, cloud_control_ident)
+
+        if ok:
+            self._schedule_post_command_refresh(target_position)
+        return ok
+
+    async def _send_ble_first(self, ble_cmd_id: int, cloud_control_ident: int) -> bool:
+        """BLE, then cloud, then BLE again once a connect has had time to land."""
+        if await self._send_ble_command(ble_cmd_id):
+            _LOGGER.debug("BLE command confirmed (ack)")
+            return True
+
+        _LOGGER.debug("BLE unavailable/unconfirmed, falling back to cloud command")
+        ok = await self._send_cloud_command(cloud_control_ident)
+        if ok:
+            return True
+
+        # The cloud refuses while the door is off WiFi, but the opener is still
+        # there over BLE — a connect started above is often seconds from ready,
+        # so let local control have the last word.
+        _LOGGER.debug("Cloud command failed; waiting for BLE to retry locally")
+        if await self._async_wait_for_ble(BLE_COMMAND_CONNECT_WAIT):
+            if await self._send_ble_command(ble_cmd_id):
+                _LOGGER.debug("BLE command confirmed (ack) after cloud failure")
+                self._last_command_error = None
+                return True
+        return False
+
+    async def _send_cloud_first(self, ble_cmd_id: int, cloud_control_ident: int) -> bool:
+        """Cloud, then BLE — the mirror of _send_ble_first.
+
+        The door can be on WiFi but slow to answer, or off it entirely, so a
+        refused cloud command still gets the local path as a second chance.
+        """
+        if await self._send_cloud_command(cloud_control_ident):
+            return True
+
+        _LOGGER.debug("Cloud command failed; falling back to BLE")
+        if await self._async_wait_for_ble(BLE_COMMAND_CONNECT_WAIT):
+            if await self._send_ble_command(ble_cmd_id):
+                _LOGGER.debug("BLE command confirmed (ack) after cloud failure")
+                self._last_command_error = None
+                return True
+        return False
+
+    async def _send_ble_only(self, ble_cmd_id: int) -> bool:
+        """BLE, with one retry after waiting for a connect. Never the cloud.
+
+        Unlike the mixed modes there is nothing to fall back to, so it is worth
+        paying the connect wait up front rather than failing on a link that was
+        about to come up.
+        """
+        if await self._send_ble_command(ble_cmd_id):
+            _LOGGER.debug("BLE command confirmed (ack)")
+            return True
+
+        if await self._async_wait_for_ble(BLE_COMMAND_CONNECT_WAIT):
+            if await self._send_ble_command(ble_cmd_id):
+                _LOGGER.debug("BLE command confirmed (ack) after waiting for connect")
+                return True
+
+        self._last_command_error = (
+            "the opener did not answer over Bluetooth, and the connection mode "
+            "is set to Bluetooth only so the cloud was not tried"
+        )
+        return False
+
+    @callback
+    def command_error(self, action: str) -> HomeAssistantError:
+        """The error to raise when a command didn't reach the door.
+
+        Returning False here would let Home Assistant report the action as
+        successful while the door never moved.
+        """
+        detail = self._last_command_error or (
+            "Bluetooth was unavailable and the cloud API could not be reached"
+        )
+        return HomeAssistantError(f"Could not {action}: {detail}")
+
+    @callback
+    def _schedule_post_command_refresh(self, target_position: int | None) -> None:
+        if self._post_command_refresh is not None:
+            self._post_command_refresh.cancel()
+        self._post_command_refresh = self.hass.async_create_task(
+            self._async_post_command_refresh(target_position)
+        )
+
+    async def _async_post_command_refresh(self, target_position: int | None) -> None:
+        """Poll the cloud API briefly after a command to converge state quickly."""
+        if not self._cloud_enabled:
+            # Nothing to converge against: the command's own BLE reply already
+            # carried a fresh report, and it is the only state source there is.
+            return
+        try:
+            for _ in range(10):
+                await asyncio.sleep(2)
+                if self.position_is_local():
+                    # BLE is streaming the position; the cloud can only be
+                    # staler, so there is nothing to converge.
+                    return
+                info = await self._async_fetch_device_info()
+                if info is None:
+                    continue
+                self._apply_device_info(info, push_update=True)
+                if target_position is None or self.door_position == target_position:
+                    return
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if asyncio.current_task() is self._post_command_refresh:
+                self._post_command_refresh = None
+
+    # -----------------------------------------------------------------
+    # Cloud command path
+    # -----------------------------------------------------------------
+
+    async def _send_cloud_command(self, control_ident: int) -> bool:
+        """Send a command via the cloud HTTP gateway."""
+        if not self._cloud_enabled:
+            return False
+        session = async_get_clientsession(self.hass)
+        url = f"{CLOUD_GATEWAY_URL}/device/control/{self._device_code}"
+        params = {
+            "timestamp": int(time.time()),
+            "controlIdent": control_ident,
+        }
+        headers = {
+            "Accept-Language": "en",
+            "Api-Version": API_VERSION,
+            "client-id": "f-linx",
+        }
+        for _ in range(2):
+            token = await self._account.async_get_token(session)
+            if not token:
+                _LOGGER.error("Cloud command failed: unable to authenticate")
+                self._last_command_error = "could not sign in to the F-LINX cloud"
+                return False
+            headers["Authorization"] = f"Bearer {token}"
+            try:
+                async with session.get(url, params=params, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("code") == 200:
+                            _LOGGER.debug("Cloud command OK (controlIdent=%s)", control_ident)
+                            return True
+                        msg = data.get("msg", "unknown error")
+                        # Re-auth and retry on token/auth errors
+                        if "认证" in msg or "token" in msg.lower() or "auth" in msg.lower():
+                            _LOGGER.debug("Cloud token expired, re-authenticating")
+                            self._account.async_invalidate_token()
+                            continue
+                        # Only known messages are safe to expose. An arbitrary
+                        # response can echo account or device identifiers.
+                        safe_message = {
+                            "device is offline": "Device is offline",
+                            "too frequent operation": "Too frequent operation",
+                        }.get(msg.strip().casefold(), "Command rejected")
+                        _LOGGER.warning("Cloud command rejected: %s", safe_message)
+                        self._last_command_error = f"the F-LINX cloud said \"{safe_message}\""
+                        return False
+                    elif resp.status == 401:
+                        self._account.async_invalidate_token()
+                        continue
+                    else:
+                        _LOGGER.warning("Cloud command HTTP %s", resp.status)
+                        self._last_command_error = (
+                            f"the F-LINX cloud returned HTTP {resp.status}"
+                        )
+                        return False
+            except aiohttp.ClientError as err:
+                _LOGGER.warning("Cloud command error (%s)", type(err).__name__)
+                self._last_command_error = "the F-LINX cloud is unreachable"
+                return False
+        self._last_command_error = "the F-LINX cloud kept rejecting the session"
+        return False
+
+    # -----------------------------------------------------------------
+    # REST fallback (used when MQTT is disconnected or stale)
+    # -----------------------------------------------------------------
+
+    async def _api_get_device_info(
+        self, session: aiohttp.ClientSession
+    ) -> dict[str, Any] | None:
+        # Bound the 401 retry: invalidate, re-login once, then give up so a
+        # persistently rejected session cannot recurse into a login storm.
+        for _ in range(2):
+            token = await self._account.async_get_token(session)
+            if not token:
+                return None
+
+            url = f"{API_BASE_URL}/device/deviceInfo/{self._device_code}"
+            headers = {
+                "api-version": API_VERSION,
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            try:
+                async with session.post(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("code") == 200:
+                            return data.get("data", {})
+                    elif resp.status == 401:
+                        self._account.async_invalidate_token()
+                        continue
+                    return None
+            except aiohttp.ClientError as err:
+                _LOGGER.debug("API get device info error (%s)", type(err).__name__)
+                return None
+        return None
+
+    def _apply_device_info(self, info: dict[str, Any], push_update: bool) -> None:
+        changed = False
+
+        # deviceInfo carries the opener's BLE name; picking it up here means an
+        # entry migrated from pre-3.0 gets an exact BLE match without the user
+        # having to re-run the config flow.
+        ble_name = info.get(API_KEY_BLE_NAME)
+        if ble_name and ble_name != self._ble_name:
+            _LOGGER.debug("Cloud opener identity updated")
+            self._ble_name = ble_name
+
+        for attr in info.get("attributes", []):
+            code = attr.get("attributeCode")
+            value = attr.get("attributeValue")
+            if code == ATTR_DOOR_POSITION:
+                # The REST snapshot carries no timestamp of its own.
+                if not self._accept_position(value, "cloud", None):
+                    continue
+                self.position_updated_at = self.hass.loop.time()
+                self.position_source = "cloud"
+                self._position_ts = time.time()
+                if value != self.door_position:
+                    self.door_position = value
+                    changed = True
+            elif code == ATTR_OPERATED_CYCLES and value != self.operated_cycles:
+                self.operated_cycles = value
+                changed = True
+            elif code == ATTR_LED_ACTUAL:
+                new_led_state = value == 0xF0
+                if new_led_state != self.led_state:
+                    self.led_state = new_led_state
+                    changed = True
+
+        firmware_version = info.get("firmwareVersion")
+        if firmware_version != self.firmware_version:
+            self.firmware_version = firmware_version
+            changed = True
+
+        is_online = info.get("onlineState") == 1
+        if is_online != self.is_online:
+            self.is_online = is_online
+            changed = True
+
+        if changed and push_update:
+            self.async_set_updated_data(self._build_state())
+
+    async def _async_fetch_device_info(self) -> dict[str, Any] | None:
+        return await self._api_get_device_info(async_get_clientsession(self.hass))
+
+    async def async_force_refresh(self) -> None:
+        """Force a cloud REST state read, bypassing the MQTT-freshness check.
+
+        Used by the flinx_garage.refresh_state action and the optional periodic
+        poll so state can be re-synced on demand when MQTT is unreliable.
+        """
+        if not self._cloud_enabled:
+            raise HomeAssistantError(
+                f"Cannot refresh {self._door_alias} from the cloud: the "
+                "connection mode is set to Bluetooth only"
+            )
+        info = await self._async_fetch_device_info()
+        if info is None:
+            raise HomeAssistantError(
+                "Unable to reach the F-LINX cloud API to refresh state"
+            )
+        self._apply_device_info(info, push_update=True)
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Periodic tick: mostly a fallback when MQTT is stale."""
+        # Opportunistically (re)establish BLE — doesn't fail the update if it can't.
+        if not self.is_ble_connected:
+            self._async_start_connect()
+
+        if not self._cloud_enabled:
+            # Bluetooth-only: there is no cloud to fall back to, so the tick is
+            # just the BLE reconnect above. Returning the state we have (rather
+            # than raising) is what keeps the first refresh — and therefore
+            # setup — from failing on a door that hasn't reported yet.
+            return self._build_state()
+
+        mqtt_fresh = (
+            self.mqtt.is_connected
+            and self.last_mqtt_ts
+            and time.time() - self.last_mqtt_ts < MQTT_STALE_THRESHOLD
+        )
+
+        if mqtt_fresh:
+            # MQTT is delivering — nothing more to do, return current state.
+            return self._build_state()
+
+        # MQTT is down/stale. Poll the REST API to keep state current.
+        _LOGGER.debug("MQTT stale — polling REST API for state")
+        info = await self._async_fetch_device_info()
+
+        if info is None:
+            # Don't flap entities if we just can't reach the API —
+            # UpdateFailed will mark them unavailable after several failures.
+            raise UpdateFailed("MQTT and API both unreachable")
+
+        self._apply_device_info(info, push_update=False)
+
+        return self._build_state()
+
+    # -----------------------------------------------------------------
+    # Convenience accessors
+    # -----------------------------------------------------------------
+
+    @property
+    def is_closed(self) -> bool | None:
+        if self.door_position is None:
+            return None
+        return self.door_position == 0
+
+    @property
+    def current_cover_position(self) -> int | None:
+        return self.door_position
+
+    # -----------------------------------------------------------------
+    # Lifecycle
+    # -----------------------------------------------------------------
+
+    async def async_start(self) -> None:
+        """Start MQTT connection and kick off first update."""
+        if not self._cloud_enabled:
+            _LOGGER.debug(
+                "Bluetooth-only mode: not connecting to MQTT and not polling the "
+                "cloud"
+            )
+            self._async_start_connect()
+            return
+
+        await self.mqtt.connect()
+
+        # Optional unconditional periodic cloud poll (off by default).
+        if self._poll_interval > 0:
+            _LOGGER.debug(
+                "Scheduling periodic cloud poll every %ss", self._poll_interval
+            )
+            self._poll_unsub = async_track_time_interval(
+                self.hass,
+                self._async_periodic_poll,
+                timedelta(seconds=self._poll_interval),
+            )
+
+    async def _async_periodic_poll(self, now: datetime) -> None:
+        """Periodic cloud poll, independent of the MQTT-stale fallback."""
+        try:
+            await self.async_force_refresh()
+        except HomeAssistantError as err:
+            # Don't let a transient API hiccup bubble out of the timer.
+            _LOGGER.debug("Periodic cloud poll failed (%s)", type(err).__name__)
+
+    async def async_shutdown(self) -> None:
+        """Cancel scheduled work and disconnect MQTT and BLE cleanly."""
+        self._closing = True
+        await super().async_shutdown()
+        if self._poll_unsub is not None:
+            self._poll_unsub()
+            self._poll_unsub = None
+        if self._post_command_refresh is not None:
+            self._post_command_refresh.cancel()
+        if self._connect_task is not None:
+            self._connect_task.cancel()
+            self._connect_task = None
+        self._cancel_position_task()
+        await self.mqtt.disconnect()
+        if self._ble_client and self._ble_client.is_connected:
+            for char_uuid in (BLE_NOTIFY_CHAR, BLE_NOTIFY_CHAR2):
+                try:
+                    await self._ble_client.stop_notify(char_uuid)
+                except BleakError:
+                    # Never subscribed on this link, or already torn down.
+                    # Must not skip the disconnect below: that frees the slot.
+                    pass
+            try:
+                await self._ble_client.disconnect()
+            except BleakError:
+                pass

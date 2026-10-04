@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="280" viewBox="0 0 960 280" role="img" aria-labelledby="title desc">
+  <title id="title">F-LINX Garage Door for Home Assistant</title>
+  <desc id="desc">An open garage door with a warm light. Open sesame. Welcome home.</desc>
+  <rect width="960" height="280" rx="24" fill="#102c3d"/>
+  <path d="M63 230V102l100-57 100 57v128" fill="none" stroke="#e6f6fa" stroke-width="8" stroke-linejoin="round"/>
+  <rect x="92" y="111" width="142" height="119" rx="4" fill="#ffdf84"/>
+  <path d="M92 111h142v48H92z" fill="#41bdf5"/>
+  <path d="M98 128h130M98 145h130" stroke="#102c3d" stroke-width="3"/>
+  <path d="M119 210h88M129 195h68" stroke="#b98e3d" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="163" cy="91" r="7" fill="#ffdf84"/>
+  <text x="316" y="99" fill="#41bdf5" font-family="system-ui, sans-serif" font-size="18" font-weight="600" letter-spacing="2">HOME ASSISTANT · HACS</text>
+  <text x="316" y="152" fill="#fff" font-family="system-ui, sans-serif" font-size="39" font-weight="700">F-LINX Garage Door</text>
+  <text x="316" y="198" fill="#d2e7ed" font-family="system-ui, sans-serif" font-size="24">Open sesame. Welcome home.</text>
+</svg>

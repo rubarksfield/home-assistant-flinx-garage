@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+*.xapk
+*.apk
+*.ipa
+
+.venv/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.env.*
+
+# Household data and captures must stay outside the published source.
+private/
+.storage/
+configuration.yaml
+secrets.yaml
+*.pcap
+*.pcapng
+*.har
+*.log

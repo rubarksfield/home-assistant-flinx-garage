@@ -1,0 +1,13 @@
+title = "F-LINX publication scan"
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Exact shared MQTT app constant in upstream public source; not a household credential"
+condition = "AND"
+regexTarget = "match"
+paths = ["(^|/)custom_components/flinx_garage/const\\.py$"]
+regexes = ["^MQTT_PASSWORD\\ =\\ \"GwZEJ9R8RNi3yP4c\"$"]
