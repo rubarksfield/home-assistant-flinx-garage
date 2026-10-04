@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Removed the redundant `aiohttp` manifest requirement; Home Assistant already supplies it, as required by hassfest.
 - Logs no longer expose account responses, device topics, payloads, opener identities, aliases or raw exception URLs.
 - Arbitrary cloud rejection messages no longer appear in Home Assistant errors. Known offline and rate-limit messages remain readable.
 
